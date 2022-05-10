@@ -1,0 +1,202 @@
+*Orchestrating the Cloud with Kubernetes*
+1)start up a cluster: gcloud container clusters create io
+2)clone the github repo files: gsutil cp -r gs://spls/gsp021/* 
+3)launch a single instance of the nginx container: kubectl create deployment nginx --image=nginx:1.10.0
+4)view the running nginx container: kubectl get pods
+5)expose nginx container outside of Kubernetes (Kubernetes created an external Load Balancer with a public IP address): 
+  kubectl expose deployment nginx --port 80 --type LoadBalancer
+6)list services: kubectl get services
+7)hit the Nginx container remotely: curl http://<External IP>:80
+8)create the monolith pod: kubectl create -f pods/monolith.yaml
+9)map a local port to a port inside the monolith pod: (in new terminal tab) kubectl port-forward monolith 10080:80 
+  (in older terminal tab) curl http://127.0.0.1:10080
+10)logging in to get an auth token: curl -u user http://127.0.0.1:10080/login
+11)create env variable for token: TOKEN=$(curl http://127.0.0.1:10080/login -u user|jq -r '.token')
+12)run an interactive shell inside the Monolith Pod: kubectl exec monolith --stdin --tty -c monolith /bin/sh
+13)test external connectivity: ping -c 3 google.com
+14)exit interactive shell: exit
+15)Creating a Service: 
+  i. Create the secure-monolith pods and their configuration data: 
+  kubectl create secret generic tls-certs --from-file tls/ 
+  kubectl create configmap nginx-proxy-conf --from-file nginx/proxy.conf
+  kubectl create -f pods/secure-monolith.yaml
+  ii. create the monolith service from the monolith service configuration file: kubectl create -f services/monolith.yaml
+  iii. allow traffic to the monolith service on the exposed nodeport: 
+  gcloud compute firewall-rules create allow-monolith-nodeport \ --allow=tcp:31000
+16)get an external IP address for one of the nodes: gcloud compute instances list
+17)Adding Labels to Pods: kubectl label pods secure-monolith 'secure=enabled'
+  check labels: kubectl get pods secure-monolith --show-labels
+18)view the list of endpoints on the monolith service: kubectl describe services monolith | grep Endpoints
+19)Deploying Applications with Kubernetes: 
+  kubectl create -f deployments/auth.yaml
+  kubectl create -f services/auth.yaml
+20)expose the frontend Deployment: 
+kubectl create configmap nginx-frontend-conf --from-file=nginx/frontend.conf
+kubectl create -f deployments/frontend.yaml
+kubectl create -f services/frontend.yaml
+
+*Continuous Delivery Pipelines with Spinnaker and Kubernetes Engine*
+1)Create a Kubernetes Engine using the Spinnaker tutorial sample application: 
+  gcloud container clusters create spinnaker-tutorial \
+    --machine-type=n1-standard-2
+2)Upload your startup script to a Cloud Storage bucket:
+  i. Create the service account: gcloud iam service-accounts create spinnaker-account \
+    --display-name spinnaker-account
+  ii. Store the service account email address and your current project ID in environment variables for use in later commands:
+     export SA_EMAIL=$(gcloud iam service-accounts list \
+    --filter="displayName:spinnaker-account" \
+    --format='value(email)')
+    export PROJECT=$(gcloud info --format='value(config.project)')
+  iii. Bind the storage.admin role to your service account: gcloud projects add-iam-policy-binding $PROJECT \
+    --role roles/storage.admin \
+    --member serviceAccount:$SA_EMAIL
+  iv.Download the service account key: gcloud iam service-accounts keys create spinnaker-sa.json \
+     --iam-account $SA_EMAIL
+3)Set up Cloud Pub/Sub to trigger Spinnaker pipelines:
+  i. Create the Cloud Pub/Sub topic for notifications from Container Registry: 
+    gcloud pubsub topics create projects/$PROJECT/topics/gcr
+  ii.Create a subscription: gcloud pubsub subscriptions create gcr-triggers \
+    --topic projects/${PROJECT}/topics/gcr
+  iii. Give Spinnaker's service account permissions to read from the gcr-triggers subscription:
+    export SA_EMAIL=$(gcloud iam service-accounts list \
+    --filter="displayName:spinnaker-account" \
+    --format='value(email)')
+    gcloud beta pubsub subscriptions add-iam-policy-binding gcr-triggers \
+    --role roles/pubsub.subscriber --member serviceAccount:$SA_EMAIL
+4) Install Helm:
+  wget https://get.helm.sh/helm-v3.1.0-linux-amd64.tar.gz
+  tar zxfv helm-v3.1.0-linux-amd64.tar.gz
+  cp linux-amd64/helm .
+5) Grant Helm the cluster-admin role in your cluster: kubectl create clusterrolebinding user-admin-binding \
+    --clusterrole=cluster-admin --user=$(gcloud config get-value account)
+6) Grant Spinnaker the cluster-admin role: kubectl create clusterrolebinding --clusterrole=cluster-admin \
+    --serviceaccount=default:default spinnaker-admin
+7) Add the stable charts deployments to Helm's usable repositories (includes Spinnaker):
+  ./helm repo add stable https://kubernetes-charts.storage.googleapis.com
+  ./helm repo update
+8) create a bucket for Spinnaker to store its pipeline configuration:
+  export PROJECT=$(gcloud info \
+    --format='value(config.project)')
+  export BUCKET=$PROJECT-spinnaker-config
+  gsutil mb -c regional -l us-central1 gs://$BUCKET
+9)create a spinnaker-config.yaml file:
+export SA_JSON=$(cat spinnaker-sa.json)
+export PROJECT=$(gcloud info --format='value(config.project)')
+export BUCKET=$PROJECT-spinnaker-config
+cat > spinnaker-config.yaml <<EOF
+gcs:
+  enabled: true
+  bucket: $BUCKET
+  project: $PROJECT
+  jsonKey: '$SA_JSON'
+
+dockerRegistries:
+- name: gcr
+  address: https://gcr.io
+  username: _json_key
+  password: '$SA_JSON'
+  email: 1234@5678.com
+
+# Disable minio as the default storage backend
+minio:
+  enabled: false
+
+# Configure Spinnaker to enable GCP services
+halyard:
+  additionalScripts:
+    create: true
+    data:
+      enable_gcs_artifacts.sh: |-
+        \$HAL_COMMAND config artifact gcs account add gcs-$PROJECT --json-path /opt/gcs/key.json
+        \$HAL_COMMAND config artifact gcs enable
+      enable_pubsub_triggers.sh: |-
+        \$HAL_COMMAND config pubsub google enable
+        \$HAL_COMMAND config pubsub google subscription add gcr-triggers \
+          --subscription-name gcr-triggers \
+          --json-path /opt/gcs/key.json \
+          --project $PROJECT \
+          --message-format GCR
+EOF
+10)Deploy the Spinnaker chart: [To open the Spinnaker user interface, click the Web Preview icon at the top of the Cloud Shell 
+window and select Preview on port 8080.]
+./helm install -n default cd stable/spinnaker -f spinnaker-config.yaml \
+           --version 2.0.0-rc9 --timeout 10m0s --wait
+export DECK_POD=$(kubectl get pods --namespace default -l "cluster=spin-deck" \
+    -o jsonpath="{.items[0].metadata.name}")
+kubectl port-forward --namespace default $DECK_POD 8080:9000 >> /dev/null &
+11) Create your source code repository:
+gsutil -m cp -r gs://spls/gsp114/sample-app.tar .
+mkdir sample-app
+tar xvf sample-app.tar -C ./sample-app
+cd sample-app
+git config --global user.email "$(gcloud config get-value core/account)"
+git config --global user.name "[USERNAME]" CHANGE USERNAME HERE
+git init
+git add .
+git commit -m "Initial commit"
+gcloud source repos create sample-app
+git config credential.helper gcloud.sh
+export PROJECT=$(gcloud info --format='value(config.project)')
+git remote add origin https://source.developers.google.com/p/$PROJECT/r/sample-app
+git push origin master
+12) see your source code in the Console: Nav menu > Source Reops > View all reops > sample-app
+13)Configure your build triggers:  Navigation menu > Cloud Build > Triggers > create trigger
+Name:sample-app-tags
+Event: Push new tag
+Select your newly created sample-app repository.
+Tag: v.*
+Build configuration: Cloud Build configuration file (yaml or json)
+Cloud Build configuration file location: /cloudbuild.yaml
+14) Prepare your Kubernetes Manifests for use in Spinnaker:
+export PROJECT=$(gcloud info --format='value(config.project)')
+gsutil mb -l us-central1 gs://$PROJECT-kubernetes-manifests
+gsutil versioning set on gs://$PROJECT-kubernetes-manifests
+sed -i s/PROJECT/$PROJECT/g k8s/deployments/*
+git commit -a -m "Set project ID"
+15)Build your image:
+git tag v1.0.0
+git push --tags
+Go to the Cloud Console. Still in Cloud Build, click History in the left pane to check that the build has been triggered. 
+If not, verify that the trigger was configured properly in the previous section.
+16)configuring your deployment pipelines:
+  i. install the spin CLI for managing Spinnaker:
+    curl -LO https://storage.googleapis.com/spinnaker-artifacts/spin/1.14.0/linux/amd64/spin
+    chmod +x spin
+  ii. Create the deployment pipeline: 
+    ./spin application save --application-name sample \
+                        --owner-email "$(gcloud config get-value core/account)" \
+                        --cloud-providers kubernetes \
+                        --gate-endpoint http://localhost:8080/gate
+    export PROJECT=$(gcloud info --format='value(config.project)')
+sed s/PROJECT/$PROJECT/g spinnaker/pipeline-deploy.json > pipeline.json
+./spin pipeline save --gate-endpoint http://localhost:8080/gate -f pipeline.json
+  iii. Manually Trigger and View your pipeline execution:
+  In the Spinnaker UI and click Applications at the top of the screen to see your list of managed applications. sample is your
+  application. If you don't see sample, try refreshing the Spinnaker Applications tab.
+  Click sample to view your application deployment.
+  Click Pipelines at the top to view your applications pipeline status.
+  Click Start Manual Execution to trigger the pipeline this first time.
+  Click Run
+  Hover over the yellow "person" icon and click Continue
+  To view the app, select Infrastructure > Load Balancers in the top
+  
+  
+  
+*Challenge Lab*
+
+ref:
+https://chriskyfung.github.io/blog/qwiklabs/Deploy-and-Manage-Cloud-Environments-with-Google-Cloud-Challenge-Lab
+
+1) set zone, region
+2) Nav > Deployment Manager > where is the jumphost?
+3) cd /work/dm ~/
+4) ls
+5) nano prod-network.yaml, change the zone. nano prod-network.jinja, change zone.
+6) gcloud deployment-manager deployments create prod-network --config prod-network.yaml 
+7) create cluster with 2 nodes, network instance kraken-prod-vpc
+8) from connect button in cluster, copy command for get credentials and run in ssh before creating service, backend and frontend
+cd /work/k8s ~/ 
+ls
+create services using kubectl create -f services/????.yaml
+9) click on kraken-admin and find instance id inside
+10) open a fresh second terminal for forwarding port
