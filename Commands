@@ -12,3 +12,4 @@ kubectl create -f nginx-deployment.yaml
 
 kubectl create deployment --image=nginx nginx --replicas=4 --dry-run=client -o yaml > nginx-deployment.yaml
 
+kubectl create deployment webapp --image=kodekloud/webapp-color --replicas=3
